@@ -2,7 +2,7 @@
 
 A photo editing application.
 
-[!screen shot](screenshot.png)
+![screen shot](screenshot.png)
 
 ## todo
 
