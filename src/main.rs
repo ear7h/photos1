@@ -159,7 +159,11 @@ lowp float luminance(lowp vec4 color) {
 }
 
 void main() {
-    lowp vec4 color = (invert > 0 ? -1. : 1.) * texture2D(Texture, uv);
+    lowp vec4 color = texture2D(Texture, uv);
+
+    if (invert > 0) {
+        color = 1. - color;
+    }
 
     // contrast and brightness
     color = clamp(unit2nnreal(contrast) * (color - .5) + .5 + brightness, 0., 1.);
@@ -168,13 +172,14 @@ void main() {
     lowp float lum = 2. * lum0 - 1.; // desired luminance
     if (lum0 > .5) {
         // highlight
-        lum = pow(lum, unit2nnreal(1. - highlight)) / 2. * unit2nnreal(white_pt) + .5;
+        lum = pow(lum * unit2nnreal(white_pt), unit2nnreal(1. - highlight)) / 2. + .5;
     } else {
         // shadow
-        lum = -pow(-lum, unit2nnreal(shadow)) / 2. * unit2nnreal(1. - black_pt) + .5;
+        lum = -pow(-lum * unit2nnreal(1. - black_pt), unit2nnreal(shadow)) / 2. + .5;
     }
 
     color *= clamp(lum, 0., 1.)/lum0;
+
     gl_FragColor = color;
 }
 "#;
