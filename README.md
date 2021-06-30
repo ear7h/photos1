@@ -12,7 +12,7 @@ A photo editing application.
 	* [ ] saturation
 	* [x] temperature
 	* [ ] tint
-	* [ ] toggle original
+	* [x] toggle original
 * ui
 	* [ ] zoom and pan image
 	* [ ] crop, small rotations, and 90 degree rotations (passed through to the file)

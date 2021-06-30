@@ -10,6 +10,7 @@ uniform sampler2D Texture;
 uniform lowp float brightness;
 uniform lowp float contrast;
 uniform int invert;
+uniform int original;
 
 uniform float highlight;
 uniform float shadow;
@@ -89,11 +90,15 @@ vec3 kelvin2linear(float temperature){
 
 
 void main() {
-    lowp vec4 color = texture2D(Texture, uv);
+    vec4 color = texture2D(Texture, uv);
+    if (original > 0) {
+        gl_FragColor = color;
+        return;
+    }
 
     color.rgb = srgb2linear(color.rgb);
 
-    // color correction described: https://en.wikipedia.org/wiki/Color_balance
+    // color correction described: https://en.wikipedia.org/wiki/Color_balance#Mathematics_of_color_balance
     vec3 temp = kelvin2linear(temperature);
     mat3 monitorScale = mat3(
         vec3(1. / temp.r, 0., 0.),

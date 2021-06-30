@@ -12,6 +12,7 @@ struct Effects {
     white_pt : f32,
     black_pt : f32,
     temperature : f32,
+    original : u32,
 }
 
 impl Default for Effects {
@@ -25,6 +26,7 @@ impl Default for Effects {
             white_pt : 1.0,
             black_pt : 0.0,
             temperature : 6500.,
+            original : 0,
         }
     }
 }
@@ -47,6 +49,7 @@ async fn main() {
                 ("white_pt".to_string(), UniformType::Float1),
                 ("black_pt".to_string(), UniformType::Float1),
                 ("temperature".to_string(), UniformType::Float1),
+                ("original".to_string(), UniformType::Int1),
             ],
             ..Default::default()
         },
@@ -78,6 +81,8 @@ async fn main() {
             .set_uniform("black_pt", effects.black_pt);
         effects_material
             .set_uniform("temperature", effects.temperature);
+        effects_material
+            .set_uniform("original", effects.original);
 
         draw_texture_ex(
             texture,
@@ -92,8 +97,20 @@ async fn main() {
         gl_use_default_material();
 
         egui_macroquad::ui(|ctx| {
-            egui::Window::new("window")
+            egui::TopBottomPanel::top("menu bar")
                 .show(ctx, |ui| {
+                    egui::menu::bar(ui, |ui| {
+                        egui::menu::menu(ui, "File", |ui| {
+                            if ui.button("Open").clicked() {
+                                println!("open!");
+                            }
+                        });
+                    });
+                });
+
+            egui::SidePanel::right("effects")
+                .show(ctx, |ui| {
+
                     ui.label("brightness");
                     ui.add(egui::Slider::new(&mut effects.brightness, -0.5..=0.5));
 
@@ -104,7 +121,11 @@ async fn main() {
                     ui.checkbox(&mut invert, "invert");
                     effects.invert = if invert { 1 } else { 0 };
 
-                    ui.separator();
+                    let mut original = effects.original > 0;
+                    ui.checkbox(&mut original, "original");
+                    effects.original = if original { 1 } else { 0 };
+
+                    // ui.separator();
 
                     ui.label("highlight");
                     ui.add(egui::Slider::new(&mut effects.highlight, 0.0..=1.0));
@@ -118,7 +139,7 @@ async fn main() {
                     ui.label("black point");
                     ui.add(egui::Slider::new(&mut effects.black_pt, 0.0..=1.0));
 
-                    ui.separator();
+                    // ui.separator();
 
                     ui.label("temperature");
                     ui.add(egui::Slider::new(&mut effects.temperature, 4000.0..=9000.0));
