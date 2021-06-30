@@ -10,10 +10,12 @@ A photo editing application.
 	* [x] brightness and contrast
 	* [x] hightlight, shadow, white pt, black pt
 	* [ ] saturation
-	* [ ] temperature and tint
+	* [x] temperature
+	* [ ] tint
 	* [ ] toggle original
 * ui
 	* [ ] zoom and pan image
+	* [ ] crop, small rotations, and 90 degree rotations (passed through to the file)
 	* [ ] handle more image formats (needs to get pixel buf from other library)
 	* [ ] folder viewer
 	* [ ] saving edits

@@ -1,5 +1,8 @@
 use macroquad::prelude::*;
 
+const EFFECTS_VERTEX_SHADER: &'static str = include_str!("effects.vert");
+const EFFECTS_FRAGMENT_SHADER: &'static str = include_str!("effects.frag");
+
 struct Effects {
     brightness : f32,
     contrast : f32,
@@ -8,6 +11,7 @@ struct Effects {
     shadow : f32,
     white_pt : f32,
     black_pt : f32,
+    temperature : f32,
 }
 
 impl Default for Effects {
@@ -18,8 +22,9 @@ impl Default for Effects {
             invert : 0,
             highlight : 0.5,
             shadow : 0.5,
-            white_pt : 0.5,
-            black_pt : 0.5,
+            white_pt : 1.0,
+            black_pt : 0.0,
+            temperature : 6500.,
         }
     }
 }
@@ -41,10 +46,14 @@ async fn main() {
                 ("shadow".to_string(), UniformType::Float1),
                 ("white_pt".to_string(), UniformType::Float1),
                 ("black_pt".to_string(), UniformType::Float1),
+                ("temperature".to_string(), UniformType::Float1),
             ],
             ..Default::default()
         },
-    ).unwrap();
+    ).unwrap_or_else(|err| {
+        println!("{}", err);
+        std::process::exit(1);
+    });
 
     let mut effects = Effects::default();
 
@@ -67,6 +76,8 @@ async fn main() {
             .set_uniform("white_pt", effects.white_pt);
         effects_material
             .set_uniform("black_pt", effects.black_pt);
+        effects_material
+            .set_uniform("temperature", effects.temperature);
 
         draw_texture_ex(
             texture,
@@ -84,7 +95,7 @@ async fn main() {
             egui::Window::new("window")
                 .show(ctx, |ui| {
                     ui.label("brightness");
-                    ui.add(egui::Slider::new(&mut effects.brightness, -1.0..=1.0));
+                    ui.add(egui::Slider::new(&mut effects.brightness, -0.5..=0.5));
 
                     ui.label("contrast");
                     ui.add(egui::Slider::new(&mut effects.contrast, 0.0..=1.0));
@@ -106,6 +117,11 @@ async fn main() {
 
                     ui.label("black point");
                     ui.add(egui::Slider::new(&mut effects.black_pt, 0.0..=1.0));
+
+                    ui.separator();
+
+                    ui.label("temperature");
+                    ui.add(egui::Slider::new(&mut effects.temperature, 4000.0..=9000.0));
                 });
         });
 
@@ -114,73 +130,4 @@ async fn main() {
         next_frame().await;
     }
 }
-
-const EFFECTS_VERTEX_SHADER: &'static str = r#"
-#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-// attribute vec4 color0;
-
-varying lowp vec2 uv;
-
-uniform mat4 Model;
-uniform mat4 Projection;
-
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1);
-    uv = texcoord;
-}
-"#;
-
-const EFFECTS_FRAGMENT_SHADER: &'static str = r#"
-#version 100
-varying lowp vec2 uv;
-
-uniform sampler2D Texture;
-
-uniform lowp float brightness;
-uniform lowp float contrast;
-uniform int invert;
-
-uniform lowp float highlight;
-uniform lowp float shadow;
-uniform lowp float black_pt;
-uniform lowp float white_pt;
-
-// f : [0, 1] -> [0, inf)
-lowp float unit2nnreal(lowp float x) {
-    return x < .5 ?
-        2. * x :
-        1. / (2.0001 - 2. * x);
-}
-
-lowp float luminance(lowp vec4 color) {
-    return 0.2126 * color.r + 0.7162 * color.g + 0.0722 * color.b;
-}
-
-void main() {
-    lowp vec4 color = texture2D(Texture, uv);
-
-    if (invert > 0) {
-        color = 1. - color;
-    }
-
-    // contrast and brightness
-    color = clamp(unit2nnreal(contrast) * (color - .5) + .5 + brightness, 0., 1.);
-
-    lowp float lum0 = luminance(color); // current luminance
-    lowp float lum = 2. * lum0 - 1.; // desired luminance
-    if (lum0 > .5) {
-        // highlight
-        lum = pow(lum * unit2nnreal(white_pt), unit2nnreal(1. - highlight)) / 2. + .5;
-    } else {
-        // shadow
-        lum = -pow(-lum * unit2nnreal(1. - black_pt), unit2nnreal(shadow)) / 2. + .5;
-    }
-
-    color *= clamp(lum, 0., 1.)/lum0;
-
-    gl_FragColor = color;
-}
-"#;
 
