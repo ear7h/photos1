@@ -1,27 +1,23 @@
-use std::sync::Arc;
+#![allow(dead_code, unused_variables, unused_imports)]
+use std::sync::{
+    Arc,
+    Mutex,
+};
+
 use std::fmt::Debug;
 
 use quick_from::QuickFrom;
 use async_trait::async_trait;
 use tokio::runtime::Runtime;
-use tokio::task::{yield_now, block_in_place};
+use tokio::task::yield_now;
+use egui::CtxRef;
 use macroquad::prelude::*;
-use parking_lot::{
-    Mutex,
-    MutexGuard,
-};
+
+mod double_buffer;
+use double_buffer::*;
 
 const EFFECTS_VERTEX_SHADER: &'static str = include_str!("effects.vert");
 const EFFECTS_FRAGMENT_SHADER: &'static str = include_str!("effects.frag");
-
-async fn async_lock_mutex<'a, T>(m : &'a Mutex<T>) -> MutexGuard<'a, T> {
-    loop {
-        match m.try_lock() {
-            Some(guard) => return guard,
-            None => yield_now().await,
-        }
-    }
-}
 
 struct TaskChannel<A : App> {
     // TODO: unbounded sender or increase bound size
@@ -30,7 +26,7 @@ struct TaskChannel<A : App> {
 }
 
 impl <A : App> TaskChannel<A> {
-    fn new(app : &'static A, model : Arc<Mutex<A::Model>>) -> Self {
+    fn new(app : &'static A, model : BufBufWrite<A::Model>) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("photos-workers")
@@ -51,7 +47,7 @@ impl <A : App> TaskChannel<A> {
                 println!("got msg : {:?}", msg);
 
                 if let Err(err) = app.update(&model, msg).await {
-                    app.handle_error(&mut model.lock(), err)
+                    app.handle_error(err)
                 }
             }
         });
@@ -68,28 +64,31 @@ impl <A : App> TaskChannel<A> {
 }
 
 fn main() {
-    run_app(&Photos{});
+    run_app::<Photos>();
 }
 
-fn run_app<A : App>(app : &'static A) {
-    macroquad::Window::new(app.name(), async move {
+fn run_app<A : App + 'static>() {
+    macroquad::Window::new(A::name(), async move {
         let mut msgs = Vec::new();
-        let model = Arc::new(Mutex::new(app.init(&mut msgs).await));
-        let task_channel = TaskChannel::<A>::new(app, Arc::clone(&model));
+        let (app, model) = A::init(&mut msgs).await;
+        let app = Box::leak(Box::new(app));
+        let bufbuf = Box::leak(Box::new(BufBuf::new(model)));
+        let task_channel = TaskChannel::<A>::new(app, bufbuf.new_write());
         loop {
-            {
-                let mut model_locked = model.lock();
-                app.render(&mut model_locked, &mut msgs).await;
-                drop(model_locked);
-            }
-
-            let frame = next_frame();
+            egui_macroquad::ui(|ctx| {
+                app.render(ctx, &mut bufbuf.lock(), &mut msgs);
+            });
+            egui_macroquad::draw();
 
             for msg in msgs.drain(..) {
                 task_channel.send(msg);
             }
 
-            frame.await;
+            bufbuf.swap(|old, new| {
+                app.swap(old, new);
+            });
+
+            next_frame().await;
         }
     });
 }
@@ -100,30 +99,31 @@ fn run_app<A : App>(app : &'static A) {
 /// runtime dynamics which are helpful in implementing something like config
 /// options.
 #[async_trait]
-pub trait App : Send + Sync {
+pub trait App : Send + Sync + Sized {
     type Model : Debug + Send + 'static;
     type Msg : Debug + Send + 'static;
     type Error : Debug;
 
     // name and handle_error do not run on a specified thread, thus should not
     // block or make assumptions of the runtime.
-    fn name(&self) -> &'static str;
-    fn handle_error(&self, _model : &mut Self::Model, err : Self::Error) {
+    fn name() -> &'static str;
+    fn handle_error(&self, err : Self::Error) {
         println!("error: {:?}", err);
     }
 
+    // the following methods run on the macroquad thread
+    async fn init(msgs : &mut Vec<Self::Msg>) -> (Self, Self::Model);
+    fn render(&self, ctx : &CtxRef, model : &mut Self::Model, msgs : &mut Vec<Self::Msg>);
+    // used for managing gpu resources
+    fn swap(&self, old : &mut Self::Model, new : &mut Self::Model);
 
-    // init and render are run on the render thread
-    async fn init(&self, msgs : &mut Vec<Self::Msg>) -> Self::Model;
-    async fn render(&self, model : &mut Self::Model, msgs : &mut Vec<Self::Msg>);
-
-    // update is run in a normal async runtime
-    async fn update(&self, model : &Mutex<Self::Model>, msg : Self::Msg) -> Result<(), Self::Error>;
+    // the following methods run in the tokio runtime
+    async fn update(&self, model : &BufBufWrite<Self::Model>, msg : Self::Msg) -> Result<(), Self::Error>;
 }
 
 
 struct Photos{
-    // TODO: add some config options
+    effects_material : Material,
 }
 
 #[derive(Debug, Clone)]
@@ -161,11 +161,42 @@ enum PhotoData {
     CPU(Image),
 }
 
+impl PhotoData {
+    fn get_texture(&mut self) -> Texture2D {
+        match self {
+            PhotoData::GPU(texture) => *texture,
+            PhotoData::CPU(image) => {
+                let texture = Texture2D::from_image(&image);
+                *self = PhotoData::GPU(texture);
+                texture
+            },
+        }
+    }
+}
+
 struct Photo {
     id : String,
     data : PhotoData,
     effects : Effects,
 }
+
+impl Photo {
+    async fn new(path : String) -> Result<Self, Error> {
+        let byt = tokio::fs::read(&path).await?;
+        let image = image::load_from_memory(&byt)?.to_rgba8();
+
+        Ok(Photo{
+            id : path,
+            data : PhotoData::CPU(Image{
+                height : image.height() as u16,
+                width : image.width() as u16,
+                bytes : image.into_raw(),
+            }),
+            effects : Default::default(),
+        })
+    }
+}
+
 impl std::fmt::Debug for Photo {
     fn fmt(&self, f : &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Image")
@@ -189,25 +220,41 @@ struct Gallery {
 
 #[derive(Debug)]
 enum Msg {
+    // Rename to OpenPhoto/OpenSingle/OpenEditor
     Open{
         path : String,
     },
+    // TODO: when the database is implemented
+    // this should be an enum:
+    //  enum PhotoSet {
+    //      Folder(String), // folder not in database
+    //      Album(u32), // an album in the database
+    //      Selection(Vec<u32>), // a selection of images in the database
+    //  }
+    OpenSet {
+        paths : Vec<String>,
+    }
 }
 
 #[derive(Debug)]
 enum Screen {
     Empty,
-    // TODO
-    // Gallery,
+    Gallery(Vec<Photo>),
     Photo(Photo),
+}
+
+impl Screen {
+    fn gallery_mut(&mut self) -> Option<&mut Vec<Photo>> {
+        match self {
+            Screen::Gallery(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct Model {
-    effects_material : Material,
-    next_screen : Option<Screen>,
     screen : Screen,
-    errors : Vec<String>,
 }
 
 #[derive(Debug, QuickFrom)]
@@ -224,11 +271,11 @@ impl App for Photos {
     type Msg = Msg;
     type Error = Error;
 
-    fn name(&self) -> &'static str {
+    fn name() -> &'static str {
         "photos"
     }
 
-    async fn init(&self, msgs : &mut Vec<Msg>) -> Self::Model {
+    async fn init(msgs : &mut Vec<Msg>) -> (Self, Self::Model) {
         let effects_material = load_material(
             EFFECTS_VERTEX_SHADER,
             EFFECTS_FRAGMENT_SHADER,
@@ -253,55 +300,62 @@ impl App for Photos {
 
         msgs.push(Msg::Open{path : "test0.png".to_string()});
 
-        Model {
-            screen : Screen::Empty,
-            next_screen : None,
-            errors : Vec::new(),
+        let self_ = Photos {
             effects_material,
+        };
+
+        let model = Model {
+            screen : Screen::Empty,
+            // next_screen : None,
+            // errors : Vec::new(),
+            // effects_material,
+        };
+
+        (self_, model)
+    }
+
+    fn swap(&self, old : &mut Model, new : &mut Model) {
+        match old.screen {
+            Screen::Photo(Photo{data : PhotoData::GPU(texture), ..}) => {
+                texture.delete();
+            }
+            _ => {},
         }
     }
 
-    async fn render(&self, model : &mut Model, msgs : &mut Vec<Msg>) {
+    fn render(&self, ctx : &CtxRef, model : &mut Model, msgs : &mut Vec<Msg>) {
         clear_background(GRAY);
 
-
-        // do any unloading
-        if model.next_screen.is_some()  {
-            match model.screen {
-                Screen::Photo(Photo{data : PhotoData::GPU(texture), ..}) => {
-                    texture.delete();
-                }
-                _ => {},
-            }
-
-            model.screen = model.next_screen.take().unwrap();
-        }
-
-        // do any loading
-        match &mut model.screen {
-            Screen::Photo(photo) => {
-                let effects_material = model.effects_material;
-                let effects = &mut photo.effects; // not copy
-
-                let texture = match &photo.data {
-                    PhotoData::GPU(texture) => *texture,
-                    PhotoData::CPU(image) => {
-                        println!("got cpu image");
-                        let texture  = Texture2D::from_image(&image);
-                        // texture.set_filter(FilterMode::Nearest);
-                        photo.data = PhotoData::GPU(texture);
-                        println!("loaded gpu texture");
-                        texture
+        egui::TopBottomPanel::top("menu bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                egui::menu::menu(ui, "File", |ui| {
+                    if ui.button("Open").clicked() {
+                        println!("open!");
+                        msgs.push(Msg::Open{path : "test1.jpg".to_string()});
                     }
-                };
 
-                gl_use_material(model.effects_material);
+                    if ui.button("Gallery").clicked() {
+                        println!("gallery!");
+                        msgs.push(Msg::OpenSet{
+                            paths : vec![
+                                "test0.png".to_string(),
+                                "test1.jpg".to_string(),
+                            ],
+                        });
+                    }
+                });
+            });
+        });
+
+        match &mut model.screen {
+            Screen::Empty => {},
+            Screen::Photo(photo) => {
 
                 macro_rules! set_uniform {
                     ($($val:ident),*) => {
                         $(
-                            effects_material
-                                .set_uniform(stringify!($val), effects.$val);
+                            self.effects_material
+                                .set_uniform(stringify!($val), photo.effects.$val);
                         )*
                     };
                 }
@@ -310,8 +364,10 @@ impl App for Photos {
                              highlight, shadow, white_pt, black_pt,
                              temperature);
 
+                gl_use_material(self.effects_material);
+
                 draw_texture_ex(
-                    texture,
+                    photo.data.get_texture(),
                     0.0,
                     0.0,
                     WHITE,
@@ -323,93 +379,119 @@ impl App for Photos {
 
                 gl_use_default_material();
 
-                egui_macroquad::ui(|ctx| {
-                    egui::TopBottomPanel::top("menu bar")
-                    .show(ctx, |ui| {
-                        egui::menu::bar(ui, |ui| {
-                            egui::menu::menu(ui, "File", |ui| {
-                                if ui.button("Open").clicked() {
-                                    println!("open!");
+                egui::SidePanel::right("effects").show(ctx, |ui| {
+                    let effects = &mut photo.effects;
 
-                                    msgs.push(Msg::Open{path : "test1.jpg".to_string()});
-                                }
-                            });
-                        });
-                    });
+                    ui.label("brightness");
+                    ui.add(egui::Slider::new(&mut effects.brightness, -0.5..=0.5));
 
-                    egui::SidePanel::right("effects")
-                    .show(ctx, |ui| {
+                    ui.label("contrast");
+                    ui.add(egui::Slider::new(&mut effects.contrast, 0.0..=1.0));
 
-                        ui.label("brightness");
-                        ui.add(egui::Slider::new(&mut effects.brightness, -0.5..=0.5));
+                    let mut invert = effects.invert > 0;
+                    ui.checkbox(&mut invert, "invert");
+                    effects.invert = if invert { 1 } else { 0 };
 
-                        ui.label("contrast");
-                        ui.add(egui::Slider::new(&mut effects.contrast, 0.0..=1.0));
+                    let mut original = effects.original > 0;
+                    ui.checkbox(&mut original, "original");
+                    effects.original = if original { 1 } else { 0 };
 
-                        let mut invert = effects.invert > 0;
-                        ui.checkbox(&mut invert, "invert");
-                        effects.invert = if invert { 1 } else { 0 };
+                    // ui.separator();
 
-                        let mut original = effects.original > 0;
-                        ui.checkbox(&mut original, "original");
-                        effects.original = if original { 1 } else { 0 };
+                    ui.label("highlight");
+                    ui.add(egui::Slider::new(&mut effects.highlight, 0.0..=1.0));
 
-                        // ui.separator();
+                    ui.label("shadow");
+                    ui.add(egui::Slider::new(&mut effects.shadow, 0.0..=1.0));
 
-                        ui.label("highlight");
-                        ui.add(egui::Slider::new(&mut effects.highlight, 0.0..=1.0));
+                    ui.label("white point");
+                    ui.add(egui::Slider::new(&mut effects.white_pt, 0.0..=1.0));
 
-                        ui.label("shadow");
-                        ui.add(egui::Slider::new(&mut effects.shadow, 0.0..=1.0));
+                    ui.label("black point");
+                    ui.add(egui::Slider::new(&mut effects.black_pt, 0.0..=1.0));
 
-                        ui.label("white point");
-                        ui.add(egui::Slider::new(&mut effects.white_pt, 0.0..=1.0));
+                    // ui.separator();
 
-                        ui.label("black point");
-                        ui.add(egui::Slider::new(&mut effects.black_pt, 0.0..=1.0));
-
-                        // ui.separator();
-
-                        ui.label("temperature");
-                        ui.add(egui::Slider::new(&mut effects.temperature, 4000.0..=9000.0));
-                    });
+                    ui.label("temperature");
+                    ui.add(egui::Slider::new(&mut effects.temperature, 4000.0..=9000.0));
                 });
-
-                egui_macroquad::draw();
             }
-            _ => {},
+            Screen::Gallery(photos) => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for photo in photos.iter_mut() {
+                        let texture = photo.data.get_texture();
+                        let button = ui.add(egui::ImageButton::new(
+                            egui::TextureId::User(
+                                texture
+                                    .raw_miniquad_texture_handle()
+                                    .gl_internal_id()
+                                    .into()
+                            ),
+                            egui::Vec2{
+                                x : 100.0,
+                                y : 100.0,
+                            }
+                        ));
+
+                        if button.on_hover_text(&photo.id).clicked() {
+                            println!("loading {}", photo.id);
+                            msgs.push(Msg::Open{path : photo.id.to_string()});
+                        }
+                    }
+                });
+            },
         }
     }
 
-    fn handle_error(&self, model : &mut Model, err : Error) {
+    fn handle_error(&self, err : Error) {
         let s = format!("{:?}", err);
         println!("{:}", s);
-        model.errors.push(s);
+        // model.errors.push(s);
     }
 
-    async fn update(&self, model_mutex : &Mutex<Self::Model>, msg : Self::Msg) -> Result<(), Error> {
-        dbg!(&msg);
+    async fn update(&self, model_buf : &BufBufWrite<Self::Model>, msg : Self::Msg) ->
+        Result<(), Error> {
 
-        macro_rules! model_lock {
-            () => {
-                async_lock_mutex(model_mutex).await
-            }
-        }
+        dbg!(&msg);
 
         match msg {
             Msg::Open{path} => {
-                let byt = tokio::fs::read(&path).await?;
-                let image = image::load_from_memory(&byt)?.to_rgba8();
+                let photo = Photo::new(path).await?;
+                model_buf.set_next(Model{
+                    screen : Screen::Photo(photo),
+                });
 
-                model_lock!().next_screen = Some(Screen::Photo(Photo{
-                    id : path,
-                    data : PhotoData::CPU(Image{
-                        height : image.height() as u16,
-                        width : image.width() as u16,
-                        bytes : image.into_raw(),
-                    }),
-                    effects : Default::default(),
-                }));
+                Ok(())
+            },
+            Msg::OpenSet{paths} => {
+                let weak = model_buf.set_next(Model{
+                    screen : Screen::Gallery(Vec::new())
+                });
+
+                // tokio::spawn(async move {
+                    for path in paths {
+                        let photo = match Photo::new(path).await {
+                            Ok(photo) => photo,
+                            Err(err) => {
+                                self.handle_error(err);
+                                break;
+                            },
+                        };
+
+                        match weak.upgrade() {
+                            None => break,
+                            Some(arc) => {
+                                arc
+                                    .lock()
+                                    .unwrap()
+                                    .screen
+                                    .gallery_mut()
+                                    .unwrap()
+                                    .push(photo);
+                            },
+                        }
+                    }
+                // });
 
                 Ok(())
             }
