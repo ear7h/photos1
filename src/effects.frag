@@ -1,11 +1,11 @@
 // vim: ft=c
 
 #version 100
-precision highp float;
+precision lowp float;
 
 varying lowp vec2 uv;
 
-uniform sampler2D Texture;
+uniform sampler2D texture;
 
 uniform lowp float brightness;
 uniform lowp float contrast;
@@ -90,8 +90,8 @@ vec3 kelvin2linear(float temperature){
 
 
 void main() {
-    vec4 color = texture2D(Texture, uv);
-    if (original > 0) {
+    vec4 color = texture2D(texture, uv);
+    if (original != 0) {
         gl_FragColor = color;
         return;
     }
@@ -117,7 +117,7 @@ void main() {
 
     color *= clamp(lum, 0., 1.)/lum0;
 
-    if (invert > 0) {
+    if (invert != 0) {
         color = 1. - color;
     }
 

@@ -5,13 +5,14 @@ edition = "2018"
 
 # image loading is way too slow without optimizations
 [profile.dev]
-opt-level = 3
+opt-level = 1
 
 [dependencies]
-macroquad = "0.3.3"
+egui_glium = "0.13.1"
+glium = "0.30.0"
 egui = "0.13.1"
-egui-macroquad = "0.5.0"
 tokio = { version = "1.7.1", features = ["sync", "rt", "rt-multi-thread", "fs"] }
 async-trait = "0.1.50"
 image = "0.23.14"
 quick_from = "0.1.0"
+glam = "0.17.1"

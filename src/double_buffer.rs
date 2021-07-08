@@ -5,8 +5,6 @@ use std::sync::{
     MutexGuard,
 };
 
-use std::cell::RefCell;
-
 pub struct BufBuf<T> {
     current : Arc<Mutex<T>>,
     next : Arc<Mutex<Option<Arc<Mutex<T>>>>>,
@@ -57,7 +55,6 @@ impl<T> Clone for BufBufWrite<T> {
     }
 }
 
-// impl<'a, T> Copy for BufBufWrite<'a, T> {}
 
 impl<T> BufBufWrite<T> {
     pub fn set_next(&self, v : T) -> Weak<Mutex<T>> {

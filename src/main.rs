@@ -1,197 +1,115 @@
 #![allow(dead_code, unused_variables, unused_imports)]
-use std::sync::{
-    Arc,
-    Mutex,
+#![allow(unused_macros)]
+
+use std::path::{
+    PathBuf,
 };
 
-use std::fmt::Debug;
+use glam::f32::{
+    Quat,
+    Mat4,
+    Vec3,
+};
 
-use quick_from::QuickFrom;
 use async_trait::async_trait;
-use tokio::runtime::Runtime;
-use tokio::task::yield_now;
 use egui::CtxRef;
-use macroquad::prelude::*;
 
-mod double_buffer;
-use double_buffer::*;
+use photos1::*;
+use photos1::double_buffer::BufBufWrite;
+/*
+    App,
+    run_app,
+    Error,
+    double_buffer::BufBufWrite,
+};
+*/
 
 const EFFECTS_VERTEX_SHADER: &'static str = include_str!("effects.vert");
 const EFFECTS_FRAGMENT_SHADER: &'static str = include_str!("effects.frag");
 
-struct TaskChannel<A : App> {
-    // TODO: unbounded sender or increase bound size
-    sender : tokio::sync::mpsc::Sender<A::Msg>,
-    _rt : Runtime,
+
+macro_rules! res_unwrap_or {
+    ($e:expr, $id:ident, $b:block) => {
+        match $e {
+            Ok(x) => x,
+            Err($id) => $b,
+        }
+    };
+    ($e:expr, $b:block) => {
+        match $e {
+            Ok(x) => x,
+            Err(_) => $b,
+        }
+    };
 }
 
-impl <A : App> TaskChannel<A> {
-    fn new(app : &'static A, model : BufBufWrite<A::Model>) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("photos-workers")
-            .build()
-            .unwrap();
+macro_rules! opt_unwrap_or {
+    ($e:expr, $b:block) => {
+        match $e {
+            Some(x) => x,
+            None => $b,
+        }
+    };
+}
 
-        let (sender, mut recv) = tokio::sync::mpsc::channel(1);
-
-        rt.spawn(async move {
-            loop {
-                println!("waiting for message");
-                let msg = if let Some(msg) = recv.recv().await {
-                    msg
-                } else {
-                    break
-                };
-
-                println!("got msg : {:?}", msg);
-
-                if let Err(err) = app.update(&model, msg).await {
-                    app.handle_error(err)
-                }
+macro_rules! spawn_err {
+    ($handler:ident, $b:tt) => {
+        tokio::spawn(async move {
+            let res = (async move $b).await;
+            match res {
+                Err(err) => $handler.handle_error(err),
+                Ok(_) => {},
             }
-        });
-
-        Self{sender, _rt : rt}
-    }
-
-    fn send(&self, msg : A::Msg) {
-        println!("sending msg : {:?}", msg);
-        self.sender
-            .blocking_send(msg)
-            .unwrap();
+        })
     }
 }
 
 fn main() {
     run_app::<Photos>();
+    //run_app::<photos1::TestApp>();
 }
 
-fn run_app<A : App + 'static>() {
-    macroquad::Window::new(A::name(), async move {
-        let mut msgs = Vec::new();
-        let (app, model) = A::init(&mut msgs).await;
-        let app = Box::leak(Box::new(app));
-        let bufbuf = Box::leak(Box::new(BufBuf::new(model)));
-        let task_channel = TaskChannel::<A>::new(app, bufbuf.new_write());
-        loop {
-            egui_macroquad::ui(|ctx| {
-                app.render(ctx, &mut bufbuf.lock(), &mut msgs);
-            });
-            egui_macroquad::draw();
-
-            for msg in msgs.drain(..) {
-                task_channel.send(msg);
-            }
-
-            bufbuf.swap(|old, new| {
-                app.swap(old, new);
-            });
-
-            next_frame().await;
-        }
-    });
-}
-
-/// Loosely based on Elm architecure, App defines a communication protocol
-/// between the render thread and worker threads. Strictly speaking, the
-/// methods should not take a Self. However, a reference to self allows some
-/// runtime dynamics which are helpful in implementing something like config
-/// options.
-#[async_trait]
-pub trait App : Send + Sync + Sized {
-    type Model : Debug + Send + 'static;
-    type Msg : Debug + Send + 'static;
-    type Error : Debug;
-
-    // name and handle_error do not run on a specified thread, thus should not
-    // block or make assumptions of the runtime.
-    fn name() -> &'static str;
-    fn handle_error(&self, err : Self::Error) {
-        println!("error: {:?}", err);
-    }
-
-    // the following methods run on the macroquad thread
-    async fn init(msgs : &mut Vec<Self::Msg>) -> (Self, Self::Model);
-    fn render(&self, ctx : &CtxRef, model : &mut Self::Model, msgs : &mut Vec<Self::Msg>);
-    // used for managing gpu resources
-    fn swap(&self, old : &mut Self::Model, new : &mut Self::Model);
-
-    // the following methods run in the tokio runtime
-    async fn update(&self, model : &BufBufWrite<Self::Model>, msg : Self::Msg) -> Result<(), Self::Error>;
-}
+struct Photos{ }
 
 
-struct Photos{
-    effects_material : Material,
-}
-
-#[derive(Debug, Clone)]
-struct Effects {
-    brightness : f32,
-    contrast : f32,
-    invert : u32,
-    highlight : f32,
-    shadow : f32,
-    white_pt : f32,
-    black_pt : f32,
-    temperature : f32,
-    original : u32,
-}
-
-impl Default for Effects {
-    fn default() -> Effects {
-        Effects {
-            brightness: 0.,
-            contrast: 0.5,
-            invert : 0,
-            highlight : 0.5,
-            shadow : 0.5,
-            white_pt : 1.0,
-            black_pt : 0.0,
-            temperature : 6500.,
-            original : 0,
-        }
-    }
-}
 
 
 enum PhotoData {
-    GPU(Texture2D),
-    CPU(Image),
+    GPU(ImageId),
+    CPU(image::RgbaImage),
 }
 
 impl PhotoData {
-    fn get_texture(&mut self) -> Texture2D {
+    fn get_image_id(&mut self, ctx : &mut RenderCtx) -> ImageId {
         match self {
-            PhotoData::GPU(texture) => *texture,
-            PhotoData::CPU(image) => {
-                let texture = Texture2D::from_image(&image);
-                *self = PhotoData::GPU(texture);
-                texture
+            PhotoData::GPU(img_id) => *img_id,
+            PhotoData::CPU(img) => {
+                let img_id = ctx.add_image(img.clone());
+                *self = PhotoData::GPU(img_id);
+                img_id
             },
         }
     }
 }
 
 struct Photo {
-    id : String,
+    id : PathBuf,
+    height : u16,
+    width : u16,
     data : PhotoData,
     effects : Effects,
 }
 
 impl Photo {
-    async fn new(path : String) -> Result<Self, Error> {
+    async fn new(path : PathBuf) -> Result<Self, Error> {
         let byt = tokio::fs::read(&path).await?;
         let image = image::load_from_memory(&byt)?.to_rgba8();
 
         Ok(Photo{
             id : path,
-            data : PhotoData::CPU(Image{
-                height : image.height() as u16,
-                width : image.width() as u16,
-                bytes : image.into_raw(),
-            }),
+            height : image.height() as u16,
+            width : image.width() as u16,
+            data : PhotoData::CPU(image),
             effects : Default::default(),
         })
     }
@@ -209,20 +127,53 @@ impl std::fmt::Debug for Photo {
 // like a Photo but, probably, lower resolution and the data
 // might not be filled in yet.
 struct Thumb {
-    id : String,
-    data : Option<PhotoData>,
+    id : PathBuf,
+    data : PhotoData,
 }
 
+impl Thumb {
+    async fn new<P>(path : P, size : f32) -> Result<Self, Error>
+    where P : Into<PathBuf>
+    {
+        let path : PathBuf = path.into();
+        let byt = tokio::fs::read(&path).await?;
+        let image = image::load_from_memory(&byt)?
+            .thumbnail(size as u32, size as u32)
+            .into_rgba8();
+
+        Ok(Thumb{
+            id : path,
+            data : PhotoData::CPU(image),
+        })
+
+    }
+}
+
+impl std::fmt::Debug for Thumb {
+    fn fmt(&self, f : &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Thumb")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
 struct Gallery {
     thumbs : Vec<Thumb>,
 }
 
 
 #[derive(Debug)]
+enum PhotoSet {
+    Folder(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug)]
 enum Msg {
     // Rename to OpenPhoto/OpenSingle/OpenEditor
     Open{
-        path : String,
+        path : PathBuf,
     },
     // TODO: when the database is implemented
     // this should be an enum:
@@ -231,20 +182,40 @@ enum Msg {
     //      Album(u32), // an album in the database
     //      Selection(Vec<u32>), // a selection of images in the database
     //  }
-    OpenSet {
-        paths : Vec<String>,
+    OpenSet(PhotoSet),
+        //paths : Vec<String>,
+    //}
+}
+
+#[derive(Debug)]
+struct PhotoScreen {
+    photo : Photo,
+    offx : f32,
+    offy : f32,
+    zoom : f32,
+}
+
+impl PhotoScreen {
+    fn new(photo : Photo) -> Self {
+        PhotoScreen {
+            photo,
+            offx : 0.,
+            offy : 0.,
+            zoom : 0.25,
+        }
     }
 }
+
 
 #[derive(Debug)]
 enum Screen {
     Empty,
-    Gallery(Vec<Photo>),
-    Photo(Photo),
+    Gallery(Gallery),
+    Photo(PhotoScreen),
 }
 
 impl Screen {
-    fn gallery_mut(&mut self) -> Option<&mut Vec<Photo>> {
+    fn gallery_mut(&mut self) -> Option<&mut Gallery> {
         match self {
             Screen::Gallery(v) => Some(v),
             _ => None,
@@ -257,16 +228,105 @@ struct Model {
     screen : Screen,
 }
 
-#[derive(Debug, QuickFrom)]
-enum Error {
-    #[quick_from]
-    Io(std::io::Error),
-    #[quick_from]
-    Image(image::ImageError),
+
+#[derive(Debug)]
+struct LocalModel {
+    effects_render : EffectsRender,
+    view_mat : Mat4,
+    open_dialog : bool,
+    open_dialog_input : String,
 }
+
+impl LocalModel {
+    fn new(effects_render : EffectsRender) -> Self {
+        LocalModel {
+            effects_render,
+            view_mat : Mat4::IDENTITY,
+            open_dialog : false,
+            open_dialog_input : "/Users/julio/Pictures/wallpapers/".to_string(),
+        }
+    }
+
+    fn update_view(&mut self, ctx : &mut RenderCtx<'_>) -> Mat4 {
+        let scale = self.view_mat.transform_vector3(Vec3::new(1.0, 0.0, 0.0)).length();
+        let mut new_scale = scale;
+
+        match ctx.background_input().map(|i| (i.modifiers, i.scroll_delta)) {
+            Some((modifiers, (dx, dy))) => {
+
+                if modifiers.shift() {
+                    // zoom
+                    new_scale *= 1.0 - dy.clamp(-10.0, 10.0) / 30.0;
+                } else {
+                    // pan
+                    let pan = Mat4::from_scale_rotation_translation(
+                        Vec3::ONE,
+                        Quat::from_rotation_z(0.0),
+                        Vec3::new(dx, dy, 0.0)
+                    );
+                    self.view_mat = pan.mul_mat4(&self.view_mat);
+                }
+
+            },
+            _ => {},
+        }
+
+        new_scale = new_scale.clamp(0.125, 8.0);
+        if scale != new_scale {
+            let (origin_x, origin_y) = ctx.background_input()
+                .map_or((0.0, 0.0), |i| {
+                    let (dim_x, dim_y) = ctx.dimensions();
+                    let (px, py) = i.pointer;
+                    (dim_x/2.0 - px, py - dim_y/2.0)
+                });
+
+            let to = Mat4::from_scale_rotation_translation(
+                Vec3::ONE,
+                Quat::from_rotation_z(0.0),
+                Vec3::new(origin_x, origin_y, 0.0)
+            );
+
+            let fro = Mat4::from_scale_rotation_translation(
+                Vec3::ONE,
+                Quat::from_rotation_z(0.0),
+                Vec3::new(-origin_x, -origin_y, 0.0)
+            );
+
+            self.view_mat = fro
+                .mul_mat4(&Mat4::from_scale(Vec3::ONE * (new_scale / scale)))
+                .mul_mat4(&to)
+                .mul_mat4(&self.view_mat);
+        }
+
+        let drag_delta = ctx
+            .background_input()
+            .map(|i| i.drag_delta())
+            .flatten();
+
+        match drag_delta {
+            Some((dx, dy, released)) => {
+                let pan = Mat4::from_scale_rotation_translation(
+                    Vec3::ONE,
+                    Quat::from_rotation_z(0.0),
+                    Vec3::new(dx, dy, 0.0)
+                );
+
+                if released {
+                    self.view_mat = pan.mul_mat4(&self.view_mat);
+                    self.view_mat
+                } else {
+                    pan.mul_mat4(&self.view_mat)
+                }
+            },
+            _ => self.view_mat,
+        }
+    }
+}
+
 
 #[async_trait]
 impl App for Photos {
+    type LocalModel = LocalModel;
     type Model = Model;
     type Msg = Msg;
     type Error = Error;
@@ -275,111 +335,106 @@ impl App for Photos {
         "photos"
     }
 
-    async fn init(msgs : &mut Vec<Msg>) -> (Self, Self::Model) {
-        let effects_material = load_material(
-            EFFECTS_VERTEX_SHADER,
-            EFFECTS_FRAGMENT_SHADER,
-            MaterialParams {
-                uniforms: vec![
-                    ("brightness".to_string(), UniformType::Float1),
-                    ("contrast".to_string(), UniformType::Float1),
-                    ("invert".to_string(), UniformType::Int1),
-                    ("highlight".to_string(), UniformType::Float1),
-                    ("shadow".to_string(), UniformType::Float1),
-                    ("white_pt".to_string(), UniformType::Float1),
-                    ("black_pt".to_string(), UniformType::Float1),
-                    ("temperature".to_string(), UniformType::Float1),
-                    ("original".to_string(), UniformType::Int1),
-                ],
-                ..Default::default()
-            },
-        ).unwrap_or_else(|err| {
-            println!("{}", err);
-            std::process::exit(1);
-        });
+    fn init(ctx : &mut InitCtx, msgs : &mut Vec<Msg>) -> (Self, Self::LocalModel, Self::Model) {
+        let effects_render = EffectsRender::new(ctx.display);
 
-        msgs.push(Msg::Open{path : "test0.png".to_string()});
+        msgs.push(Msg::OpenSet(PhotoSet::Folder("/Users/julio/Pictures/wallpapers".into())));
 
-        let self_ = Photos {
-            effects_material,
-        };
+        let self_ = Photos {};
 
         let model = Model {
             screen : Screen::Empty,
-            // next_screen : None,
             // errors : Vec::new(),
-            // effects_material,
         };
 
-        (self_, model)
+
+        (self_, LocalModel::new(effects_render), model)
     }
 
-    fn swap(&self, old : &mut Model, new : &mut Model) {
+    fn swap(&self, ctx : &mut SwapCtx, old : &mut Model, _new : &mut Model) {
+        // TODO: reuse textures from old? allocate textures for new?
         match old.screen {
-            Screen::Photo(Photo{data : PhotoData::GPU(texture), ..}) => {
-                texture.delete();
+            Screen::Photo(PhotoScreen{photo: Photo{data : PhotoData::GPU(img_id), ..}, ..}) => {
+                ctx.delete_image(img_id);
             }
             _ => {},
         }
     }
 
-    fn render(&self, ctx : &CtxRef, model : &mut Model, msgs : &mut Vec<Msg>) {
-        clear_background(GRAY);
+    fn render(&self,
+              ctx : &mut RenderCtx,
+              local_model : &mut LocalModel,
+              model : &mut Model,
+              msgs : &mut Vec<Msg>)
+    {
+        ctx.clear_color(GRAY);
 
-        egui::TopBottomPanel::top("menu bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu bar").show(ctx.egui, |ui| {
             egui::menu::bar(ui, |ui| {
                 egui::menu::menu(ui, "File", |ui| {
-                    if ui.button("Open").clicked() {
-                        println!("open!");
-                        msgs.push(Msg::Open{path : "test1.jpg".to_string()});
-                    }
+                    local_model.open_dialog |= ui.button("Open").clicked();
 
                     if ui.button("Gallery").clicked() {
                         println!("gallery!");
-                        msgs.push(Msg::OpenSet{
-                            paths : vec![
+                        msgs.push(Msg::OpenSet(PhotoSet::List(
+                            vec![
                                 "test0.png".to_string(),
                                 "test1.jpg".to_string(),
                             ],
-                        });
+                        )));
                     }
                 });
             });
         });
 
+        {
+            // TODO: native file open dialog?
+            let LocalModel{
+                open_dialog,
+                open_dialog_input,
+                ..
+            } = local_model;
+
+            let mut submitted = false;
+
+            egui::Window::new("Open File")
+                .collapsible(false)
+                .resizable(false)
+                .open(open_dialog)
+                .show(ctx.egui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Folder name: ");
+                        ui.text_edit_singleline(open_dialog_input);
+                    });
+
+                    if ui.button("open").clicked() {
+                        println!("opening: {}", open_dialog_input);
+                        let dir = std::mem::replace(open_dialog_input, String::new());
+                        msgs.push(Msg::OpenSet(PhotoSet::Folder(dir)));
+                        submitted = true;
+                    }
+                });
+
+            if submitted {
+                *open_dialog = false;
+            }
+        }
+
         match &mut model.screen {
             Screen::Empty => {},
-            Screen::Photo(photo) => {
+            Screen::Photo(photo_screen) => {
+                let view_mat = local_model.update_view(ctx);
 
-                macro_rules! set_uniform {
-                    ($($val:ident),*) => {
-                        $(
-                            self.effects_material
-                                .set_uniform(stringify!($val), photo.effects.$val);
-                        )*
-                    };
-                }
+                let photo = &mut photo_screen.photo;
+                let img_id = photo.data.get_image_id(ctx);
+                local_model.effects_render.draw_image_screen(
+                    ctx,
+                    img_id,
+                    &view_mat,
+                    &photo.effects
+                ).unwrap();
 
-                set_uniform!(brightness, contrast, invert, original,
-                             highlight, shadow, white_pt, black_pt,
-                             temperature);
-
-                gl_use_material(self.effects_material);
-
-                draw_texture_ex(
-                    photo.data.get_texture(),
-                    0.0,
-                    0.0,
-                    WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(vec2(480.0, 720.0)),
-                        ..Default::default()
-                    },
-                );
-
-                gl_use_default_material();
-
-                egui::SidePanel::right("effects").show(ctx, |ui| {
+                egui::SidePanel::right("effects").resizable(false).show(ctx.egui, |ui| {
                     let effects = &mut photo.effects;
 
                     ui.label("brightness");
@@ -415,29 +470,46 @@ impl App for Photos {
                     ui.label("temperature");
                     ui.add(egui::Slider::new(&mut effects.temperature, 4000.0..=9000.0));
                 });
-            }
-            Screen::Gallery(photos) => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    for photo in photos.iter_mut() {
-                        let texture = photo.data.get_texture();
-                        let button = ui.add(egui::ImageButton::new(
-                            egui::TextureId::User(
-                                texture
-                                    .raw_miniquad_texture_handle()
-                                    .gl_internal_id()
-                                    .into()
-                            ),
-                            egui::Vec2{
-                                x : 100.0,
-                                y : 100.0,
-                            }
-                        ));
 
-                        if button.on_hover_text(&photo.id).clicked() {
-                            println!("loading {}", photo.id);
-                            msgs.push(Msg::Open{path : photo.id.to_string()});
+                /*
+                let resp = background(ctx, egui::Sense::drag());
+                println!("drag delta: {:?}", resp.drag_delta());
+                let scroll_delta = ctx.input().scroll_delta;
+                println!("scroll delta: {:?}", scroll_delta);
+                */
+
+            }
+            Screen::Gallery(gallery) => {
+                egui::CentralPanel::default().show(ctx.egui, |ui| {
+                    let ncols = 4; //(ui.available_width() / 100.0) as usize + 1;
+                    // println!("ncols: {}", ncols);
+                    let nrows = gallery.thumbs.len() / ncols;
+
+                    // TODO: just make the rows manually
+                    egui::ScrollArea::auto_sized().show_rows(ui, 100.0, nrows, |ui, rng| {
+
+                        let start = rng.start * ncols;
+                        let end = rng.end * ncols;
+                        for row in gallery.thumbs[start..end].chunks_mut(ncols) {
+                            ui.horizontal(|ui| {
+                                for photo in row {
+                                    let egui_id = photo.data.get_image_id(ctx).egui_id();
+                                    let button = ui.add(egui::ImageButton::new(
+                                        egui_id,
+                                        egui::Vec2{
+                                            x : 100.0,
+                                            y : 100.0,
+                                        }
+                                    ));
+
+                                    if button.on_hover_text(photo.id.display()).clicked() {
+                                        println!("loading {}", photo.id.display());
+                                        msgs.push(Msg::Open{path : photo.id.clone()});
+                                    }
+                                }
+                            });
                         }
-                    }
+                    })
                 });
             },
         }
@@ -449,7 +521,7 @@ impl App for Photos {
         // model.errors.push(s);
     }
 
-    async fn update(&self, model_buf : &BufBufWrite<Self::Model>, msg : Self::Msg) ->
+    async fn update(&'static self, model_buf : &BufBufWrite<Self::Model>, msg : Self::Msg) ->
         Result<(), Error> {
 
         dbg!(&msg);
@@ -458,44 +530,66 @@ impl App for Photos {
             Msg::Open{path} => {
                 let photo = Photo::new(path).await?;
                 model_buf.set_next(Model{
-                    screen : Screen::Photo(photo),
+                    screen : Screen::Photo(PhotoScreen::new(photo)),
                 });
 
                 Ok(())
             },
-            Msg::OpenSet{paths} => {
+            Msg::OpenSet(photo_set) => {
                 let weak = model_buf.set_next(Model{
-                    screen : Screen::Gallery(Vec::new())
+                    screen : Screen::Gallery(Gallery{
+                        thumbs : Vec::new()
+                    })
                 });
 
-                // tokio::spawn(async move {
-                    for path in paths {
-                        let photo = match Photo::new(path).await {
-                            Ok(photo) => photo,
-                            Err(err) => {
-                                self.handle_error(err);
-                                break;
-                            },
-                        };
+                spawn_err!(self, {
+                    match photo_set {
+                        PhotoSet::Folder(path) => {
+                            let mut entries = tokio::fs::read_dir(path).await?;
 
-                        match weak.upgrade() {
-                            None => break,
-                            Some(arc) => {
-                                arc
-                                    .lock()
-                                    .unwrap()
+                            while let Some(entry) = entries.next_entry().await? {
+                                println!("{:?}", entry);
+                                let thumb = Thumb::new(entry.path(), 100.0).await?;
+
+                                let model = opt_unwrap_or!(weak.upgrade(), {
+                                    // the screen was dropped
+                                    break;
+                                });
+
+                                model
+                                    .lock().unwrap()
                                     .screen
-                                    .gallery_mut()
-                                    .unwrap()
-                                    .push(photo);
-                            },
+                                    .gallery_mut().unwrap()
+                                    .thumbs
+                                    .push(thumb);
+                            }
+
+                            Ok(())
+                        },
+                        PhotoSet::List(paths) => {
+                            for path in paths {
+                                let thumb = Thumb::new(path, 100.0).await?;
+
+                                let model = opt_unwrap_or!(weak.upgrade(), {
+                                    // the screen was dropped
+                                    break;
+                                });
+
+                                model
+                                    .lock().unwrap()
+                                    .screen
+                                    .gallery_mut().unwrap()
+                                    .thumbs
+                                    .push(thumb);
+                            }
+
+                            Ok(())
                         }
                     }
-                // });
+                });
 
                 Ok(())
             }
         }
     }
 }
-
