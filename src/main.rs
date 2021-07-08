@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 #![allow(unused_macros)]
 
 use std::path::{
@@ -12,21 +11,20 @@ use glam::f32::{
 };
 
 use async_trait::async_trait;
-use egui::CtxRef;
 
-use photos1::*;
-use photos1::double_buffer::BufBufWrite;
-/*
+use photos1::{
+    Error,
+    Result,
     App,
     run_app,
-    Error,
-    double_buffer::BufBufWrite,
+    BufBufWrite,
+    Effects,
+    EffectsShader,
+    RenderCtx,
+    UnrenderCtx,
+    ImageId,
+    GRAY,
 };
-*/
-
-const EFFECTS_VERTEX_SHADER: &'static str = include_str!("effects.vert");
-const EFFECTS_FRAGMENT_SHADER: &'static str = include_str!("effects.frag");
-
 
 macro_rules! res_unwrap_or {
     ($e:expr, $id:ident, $b:block) => {
@@ -66,13 +64,9 @@ macro_rules! spawn_err {
 
 fn main() {
     run_app::<Photos>();
-    //run_app::<photos1::TestApp>();
 }
 
-struct Photos{ }
-
-
-
+struct Photos{}
 
 enum PhotoData {
     GPU(ImageId),
@@ -94,21 +88,17 @@ impl PhotoData {
 
 struct Photo {
     id : PathBuf,
-    height : u16,
-    width : u16,
     data : PhotoData,
     effects : Effects,
 }
 
 impl Photo {
-    async fn new(path : PathBuf) -> Result<Self, Error> {
+    async fn new(path : PathBuf) -> Result<Self> {
         let byt = tokio::fs::read(&path).await?;
         let image = image::load_from_memory(&byt)?.to_rgba8();
 
         Ok(Photo{
             id : path,
-            height : image.height() as u16,
-            width : image.width() as u16,
             data : PhotoData::CPU(image),
             effects : Default::default(),
         })
@@ -132,7 +122,7 @@ struct Thumb {
 }
 
 impl Thumb {
-    async fn new<P>(path : P, size : f32) -> Result<Self, Error>
+    async fn new<P>(path : P, size : f32) -> Result<Self>
     where P : Into<PathBuf>
     {
         let path : PathBuf = path.into();
@@ -190,60 +180,14 @@ enum Msg {
 #[derive(Debug)]
 struct PhotoScreen {
     photo : Photo,
-    offx : f32,
-    offy : f32,
-    zoom : f32,
+    view_mat : Mat4,
 }
 
 impl PhotoScreen {
     fn new(photo : Photo) -> Self {
         PhotoScreen {
             photo,
-            offx : 0.,
-            offy : 0.,
-            zoom : 0.25,
-        }
-    }
-}
-
-
-#[derive(Debug)]
-enum Screen {
-    Empty,
-    Gallery(Gallery),
-    Photo(PhotoScreen),
-}
-
-impl Screen {
-    fn gallery_mut(&mut self) -> Option<&mut Gallery> {
-        match self {
-            Screen::Gallery(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Model {
-    screen : Screen,
-}
-
-
-#[derive(Debug)]
-struct LocalModel {
-    effects_render : EffectsRender,
-    view_mat : Mat4,
-    open_dialog : bool,
-    open_dialog_input : String,
-}
-
-impl LocalModel {
-    fn new(effects_render : EffectsRender) -> Self {
-        LocalModel {
-            effects_render,
             view_mat : Mat4::IDENTITY,
-            open_dialog : false,
-            open_dialog_input : "/Users/julio/Pictures/wallpapers/".to_string(),
         }
     }
 
@@ -324,6 +268,47 @@ impl LocalModel {
 }
 
 
+#[derive(Debug)]
+enum Screen {
+    Empty,
+    Gallery(Gallery),
+    Photo(PhotoScreen),
+}
+
+impl Screen {
+    fn gallery_mut(&mut self) -> Option<&mut Gallery> {
+        match self {
+            Screen::Gallery(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Model {
+    screen : Screen,
+}
+
+
+#[derive(Debug)]
+struct LocalModel {
+    effects_render : EffectsShader,
+    open_dialog : bool,
+    open_dialog_input : String,
+}
+
+impl LocalModel {
+    fn new(effects_render : EffectsShader) -> Self {
+        LocalModel {
+            effects_render,
+            open_dialog : false,
+            open_dialog_input : "/Users/julio/Pictures/wallpapers/".to_string(),
+        }
+    }
+
+}
+
+
 #[async_trait]
 impl App for Photos {
     type LocalModel = LocalModel;
@@ -335,8 +320,8 @@ impl App for Photos {
         "photos"
     }
 
-    fn init(ctx : &mut InitCtx, msgs : &mut Vec<Msg>) -> (Self, Self::LocalModel, Self::Model) {
-        let effects_render = EffectsRender::new(ctx.display);
+    fn init(ctx : &mut UnrenderCtx, msgs : &mut Vec<Msg>) -> (Self, Self::LocalModel, Self::Model) {
+        let effects_shader = EffectsShader::new(ctx.display);
 
         msgs.push(Msg::OpenSet(PhotoSet::Folder("/Users/julio/Pictures/wallpapers".into())));
 
@@ -348,10 +333,10 @@ impl App for Photos {
         };
 
 
-        (self_, LocalModel::new(effects_render), model)
+        (self_, LocalModel::new(effects_shader), model)
     }
 
-    fn swap(&self, ctx : &mut SwapCtx, old : &mut Model, _new : &mut Model) {
+    fn swap(&self, ctx : &mut UnrenderCtx, old : &mut Model, _new : &mut Model) {
         // TODO: reuse textures from old? allocate textures for new?
         match old.screen {
             Screen::Photo(PhotoScreen{photo: Photo{data : PhotoData::GPU(img_id), ..}, ..}) => {
@@ -423,7 +408,7 @@ impl App for Photos {
         match &mut model.screen {
             Screen::Empty => {},
             Screen::Photo(photo_screen) => {
-                let view_mat = local_model.update_view(ctx);
+                let view_mat = photo_screen.update_view(ctx);
 
                 let photo = &mut photo_screen.photo;
                 let img_id = photo.data.get_image_id(ctx);
@@ -470,15 +455,7 @@ impl App for Photos {
                     ui.label("temperature");
                     ui.add(egui::Slider::new(&mut effects.temperature, 4000.0..=9000.0));
                 });
-
-                /*
-                let resp = background(ctx, egui::Sense::drag());
-                println!("drag delta: {:?}", resp.drag_delta());
-                let scroll_delta = ctx.input().scroll_delta;
-                println!("scroll delta: {:?}", scroll_delta);
-                */
-
-            }
+            },
             Screen::Gallery(gallery) => {
                 egui::CentralPanel::default().show(ctx.egui, |ui| {
                     let ncols = 4; //(ui.available_width() / 100.0) as usize + 1;
@@ -521,8 +498,9 @@ impl App for Photos {
         // model.errors.push(s);
     }
 
-    async fn update(&'static self, model_buf : &BufBufWrite<Self::Model>, msg : Self::Msg) ->
-        Result<(), Error> {
+    async fn update(&'static self,
+                    model_buf : &BufBufWrite<Self::Model>,
+                    msg : Self::Msg) -> Result<()> {
 
         dbg!(&msg);
 

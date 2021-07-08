@@ -1,15 +1,36 @@
-#![allow(dead_code, unused_variables, unused_imports)]
+#![feature(crate_visibility_modifier)]
+
+mod double_buffer;
+pub use double_buffer::*;
+
+mod task_channel;
+use task_channel::TaskChannel;
+
+mod shaders;
+pub use shaders::{
+    Effects,
+    EffectsShader,
+};
+
+mod input;
+use input::Input;
+
+mod color;
+pub use color::*;
+
+mod utils;
+use utils::{
+    UniformsCons,
+    create_display,
+};
 
 use std::fmt::Debug;
-use egui::CtxRef;
 
-use tokio::runtime::Runtime;
 use quick_from::QuickFrom;
 use async_trait::async_trait;
 
 use glium::{
     implement_vertex,
-    program,
     GlObject,
 };
 
@@ -17,13 +38,12 @@ use glium::glutin;
 use glium::Surface;
 
 use glam::f32::{
-    Quat,
     Mat4,
-    Vec3,
+    Vec3
 };
 
-pub mod double_buffer;
-use double_buffer::*;
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, QuickFrom)]
 pub enum Error {
@@ -80,99 +100,9 @@ pub trait App : Send + Sync + Sized {
     /// the following methods run in the tokio runtime
     async fn update(&'static self,
                     model : &BufBufWrite<Self::Model>,
-                    msg : Self::Msg) -> Result<(), Self::Error>;
+                    msg : Self::Msg) -> std::result::Result<(), Self::Error>;
 }
 
-
-#[derive(Debug, Clone)]
-pub struct Effects {
-    pub brightness : f32,
-    pub contrast : f32,
-    pub invert : i32,
-    pub highlight : f32,
-    pub shadow : f32,
-    pub white_pt : f32,
-    pub black_pt : f32,
-    pub temperature : f32,
-    pub original : i32,
-}
-
-impl Default for Effects {
-    fn default() -> Effects {
-        Effects {
-            brightness: 0.,
-            contrast: 0.5,
-            invert : 0,
-            highlight : 0.5,
-            shadow : 0.5,
-            white_pt : 1.0,
-            black_pt : 0.0,
-            temperature : 6500.,
-            original : 0,
-        }
-    }
-}
-
-
-#[derive(Clone, Copy)]
-struct Vertex {
-    position : [f32; 2],
-    texcoord : [f32; 2],
-}
-
-implement_vertex!(Vertex, position, texcoord);
-
-#[derive(Debug)]
-pub struct EffectsRender {
-    program : glium::Program,
-}
-
-impl EffectsRender {
-    pub fn new(display : &glium::Display) -> Self {
-        let program = program!(display,
-            100 => {
-                vertex : include_str!("effects.vert"),
-                fragment : include_str!("effects.frag"),
-            }
-        ).unwrap();
-
-        Self{ program }
-    }
-
-    pub fn draw_image_screen(
-        &self,
-        ctx : &mut RenderCtx,
-        img_id : ImageId,
-        trans : &Mat4,
-        effects : &Effects
-    ) -> Result<(), Error> {
-
-        macro_rules! effects_uniforms {
-            ($val0:ident,$($val:ident),*,) => {
-                {
-                    let uniforms = glium::uniforms::UniformsStorage::new(
-                        stringify!($val0),
-                        effects.$val0
-                    );
-
-                    $(
-                        let uniforms = uniforms.add(stringify!($val), effects.$val);
-                    )*
-
-                    uniforms
-                }
-            };
-        }
-
-        let uniforms = effects_uniforms!(
-            brightness, contrast, invert, original,
-            highlight, shadow, white_pt, black_pt, temperature,
-        );
-
-
-        ctx.draw_image_screen(img_id, trans, &self.program, uniforms)
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ImageId {
@@ -190,6 +120,17 @@ impl ImageId {
         self.egui_id
     }
 }
+
+
+
+
+#[derive(Clone, Copy)]
+struct Vertex {
+    position : [f32; 2],
+    texcoord : [f32; 2],
+}
+
+implement_vertex!(Vertex, position, texcoord);
 
 
 pub struct GraphicsCtx {
@@ -216,13 +157,6 @@ impl GraphicsCtx {
             display,
             glium::index::PrimitiveType::TriangleStrip,
             &[1 as u16, 2, 0, 3]
-        ).unwrap();
-
-        let program = program!(display,
-            100 => {
-                vertex : include_str!("effects.vert"),
-                fragment : include_str!("effects.frag"),
-            }
         ).unwrap();
 
         Self{
@@ -307,40 +241,7 @@ impl GraphicsCtx {
 }
 
 
-fn create_display(title : &str, event_loop: &glutin::event_loop::EventLoop<()>) -> glium::Display {
-    let window_builder = glutin::window::WindowBuilder::new()
-        .with_resizable(true)
-        .with_inner_size(glutin::dpi::LogicalSize {
-            width: 800.0,
-            height: 600.0,
-        })
-        .with_title(title);
 
-    let context_builder = glutin::ContextBuilder::new()
-        .with_depth_buffer(0)
-        .with_srgb(true)
-        .with_stencil_buffer(0)
-        .with_vsync(true);
-
-    glium::Display::new(window_builder, context_builder, event_loop).unwrap()
-}
-
-struct UniformsCons<'a, X, Xs> {
-    name : &'a str,
-    value : X,
-    rest : Xs,
-}
-
-impl<'a, X, Xs> glium::uniforms::Uniforms for UniformsCons<'a, X, Xs>
-where
-    X : glium::uniforms::AsUniformValue,
-    Xs : glium::uniforms::Uniforms,
-{
-    fn visit_values<'b, F : FnMut(&str, glium::uniforms::UniformValue<'b>)>(&'b self, mut visitor : F) {
-        visitor(self.name, self.value.as_uniform_value());
-        self.rest.visit_values(visitor);
-    }
-}
 
 pub type InitCtx<'a> = UnrenderCtx<'a>;
 pub type SwapCtx<'a> = UnrenderCtx<'a>;
@@ -400,7 +301,7 @@ impl RenderCtx<'_> {
         trans : &Mat4,
         program : &glium::Program,
         uniforms : U
-    ) -> Result<(), Error>
+    ) -> Result<()>
     where
         U : glium::uniforms::Uniforms
     {
@@ -449,226 +350,6 @@ impl RenderCtx<'_> {
 
 
 
-#[derive(Debug, Default)]
-pub struct Input {
-    /// Some if currently in a drag action, the start x, start y, and if
-    /// the drag was released since the last frame
-    /// TODO: add start time and input button to sense clicks/taps
-    pub pointer_drag : Option<(f32, f32, bool)>,
-    pub pointer : (f32, f32),
-    pub scroll_delta : (f32, f32),
-    pub modifiers : glutin::event::ModifiersState,
-}
-
-impl Input {
-    fn frame_reset(&mut self) {
-        if matches!(self.pointer_drag, Some((_, _, true))) {
-            self.pointer_drag = None;
-        }
-
-        self.scroll_delta = (0.0, 0.0);
-    }
-
-    fn update(&mut self, evt : glutin::event::WindowEvent<'_>) {
-        use glutin::event::WindowEvent::*;
-        use glutin::event::ElementState;
-        use glutin::event::MouseScrollDelta;
-
-        use glutin::dpi::PhysicalPosition;
-
-        match evt {
-            CursorMoved{position, ..} => {
-                self.pointer = (position.x as f32, position.y as f32);
-            },
-            MouseInput{state, ..} => {
-                match state {
-                    ElementState::Pressed => {
-                        self.pointer_drag = Some((
-                            self.pointer.0,
-                            self.pointer.1,
-                            false,
-                        ));
-                    },
-                    ElementState::Released => {
-                        self.pointer_drag.iter_mut().for_each(|(_, _, released)| {
-                            *released = true;
-                        })
-                    }
-                }
-            },
-            ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers;
-            },
-            MouseWheel{ delta, ..} => {
-                match delta {
-                    MouseScrollDelta::LineDelta(x, y) => {
-                        // TODO: test this code path
-                        self.scroll_delta.0 += x;
-                        self.scroll_delta.1 += y;
-                    },
-                    MouseScrollDelta::PixelDelta(PhysicalPosition{x, y}) => {
-                        self.scroll_delta.0 -= x as f32;
-                        self.scroll_delta.1 -= y as f32;
-                    }
-                }
-            }
-            _ => {},
-        }
-    }
-
-    pub fn drag_delta(&self) -> Option<(f32, f32, bool)> {
-        let (x1, y1) = self.pointer;
-
-        self.pointer_drag.map(|(x0,y0, released)| {
-            (x1 - x0, y0 - y1, released)
-        })
-    }
-}
-
-
-type Color = [f32;4];
-
-pub const GRAY : Color = [0.51, 0.51, 0.51, 1.00];
-
-pub struct TestApp();
-
-#[derive(Debug)]
-pub struct TestAppLocal {
-    effects_render : EffectsRender,
-    trans : Mat4,
-    image_id : ImageId,
-}
-
-#[async_trait]
-impl App for TestApp {
-    type Model = ();
-    type LocalModel = TestAppLocal;
-    type Msg = ();
-    type Error = Error;
-
-    fn name() -> &'static str {
-        "test app!"
-    }
-
-    fn init(ctx : &mut InitCtx, _msgs : &mut Vec<()>) -> (TestApp, TestAppLocal, ()) {
-        let image = image::load(std::io::Cursor::new(&include_bytes!("./test0.png")[..]),
-            image::ImageFormat::Png).unwrap().to_rgba8();
-
-        let image_id = ctx.add_image(image);
-        let effects_render = EffectsRender::new(ctx.display);
-        let trans = Mat4::IDENTITY;
-
-        (TestApp(), TestAppLocal{effects_render, trans, image_id}, ())
-
-    }
-
-    fn render(&self,
-              ctx : &mut RenderCtx,
-              local_model : &mut TestAppLocal,
-              _model : &mut (),
-              _msgs : &mut Vec<Self::Msg>)
-    {
-        let TestAppLocal{
-            effects_render,
-            trans,
-            image_id,
-        } = local_model;
-
-            let scale = trans.transform_vector3(Vec3::new(1.0, 0.0, 0.0)).length();
-            let mut new_scale = scale;
-
-            match ctx.background_input().map(|i| (i.modifiers, i.scroll_delta)) {
-                Some((modifiers, (dx, dy))) => {
-
-                    if modifiers.shift() {
-                        // zoom
-                        new_scale *= 1.0 - dy.clamp(-10.0, 10.0) / 30.0;
-                    } else {
-                        // pan
-                        let pan = Mat4::from_scale_rotation_translation(
-                            Vec3::ONE,
-                            Quat::from_rotation_z(0.0),
-                            Vec3::new(dx, dy, 0.0)
-                        );
-                        *trans = pan.mul_mat4(&trans);
-                    }
-
-                },
-                _ => {},
-            }
-
-            new_scale = new_scale.clamp(0.125, 8.0);
-            if scale != new_scale {
-                let (origin_x, origin_y) = ctx.background_input()
-                    .map_or((0.0, 0.0), |i| {
-                        let (dim_x, dim_y) = ctx.dimensions();
-                        let (px, py) = i.pointer;
-                        (dim_x/2.0 - px, py - dim_y/2.0)
-                    });
-
-                let to = Mat4::from_scale_rotation_translation(
-                    Vec3::ONE,
-                    Quat::from_rotation_z(0.0),
-                    Vec3::new(origin_x, origin_y, 0.0)
-                );
-
-                let fro = Mat4::from_scale_rotation_translation(
-                    Vec3::ONE,
-                    Quat::from_rotation_z(0.0),
-                    Vec3::new(-origin_x, -origin_y, 0.0)
-                );
-
-                *trans = fro
-                    .mul_mat4(&Mat4::from_scale(Vec3::ONE * (new_scale / scale)))
-                    .mul_mat4(&to)
-                    .mul_mat4(&trans);
-            }
-
-            let drag_delta = ctx
-                .background_input()
-                .map(|i| i.drag_delta())
-                .flatten();
-
-            let trans = match drag_delta {
-                Some((dx, dy, released)) => {
-                    let pan = Mat4::from_scale_rotation_translation(
-                        Vec3::ONE,
-                        Quat::from_rotation_z(0.0),
-                        Vec3::new(dx, dy, 0.0)
-                    );
-
-                    if released {
-                        *trans = pan.mul_mat4(&trans);
-                        *trans
-                    } else {
-                        pan.mul_mat4(&trans)
-                    }
-                },
-                _ => *trans,
-            };
-
-
-            egui::SidePanel::left("my_side_panel").show(ctx.egui, |ui| {
-
-                ui.heading("Hello!");
-
-                ui
-                    .button("Quit")
-                    .clicked()
-                    .then(|| ctx.quit());
-
-            });
-
-
-            ctx.clear_color(GRAY);
-
-            effects_render.draw_image_screen(ctx, *image_id, &trans, &Default::default()).unwrap();
-    }
-
-    fn swap(&self, _ctx : &mut SwapCtx, _old : &mut (), _new : &mut ()) {}
-    async fn update(&'static self, _model : &BufBufWrite<()>, msg : ()) -> Result<(), Error> { Ok(()) }
-}
-
 pub fn run_app<A : App + 'static >() {
     let event_loop = glutin::event_loop::EventLoop::with_user_event();
     let display = create_display(A::name(), &event_loop);
@@ -708,7 +389,6 @@ pub fn run_app<A : App + 'static >() {
             (_, Resumed) => {
                 egui_gl.begin_frame(&display);
 
-                let egui_ctx = egui_gl.ctx();
                 let mut frame = display.draw();
                 let mut quit = false;
                 let (egui_ctx, egui_painter) = egui_gl.ctx_and_painter_mut();
@@ -784,46 +464,3 @@ pub fn run_app<A : App + 'static >() {
 }
 
 
-struct TaskChannel<A : App> {
-    // TODO: unbounded sender or increase bound size
-    sender : tokio::sync::mpsc::Sender<A::Msg>,
-    _rt : Runtime,
-}
-
-impl <A : App> TaskChannel<A> {
-    fn new(app : &'static A, model : BufBufWrite<A::Model>) -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .thread_name("photos-workers")
-            .build()
-            .unwrap();
-
-        let (sender, mut recv) = tokio::sync::mpsc::channel(1);
-
-        rt.spawn(async move {
-            loop {
-                println!("waiting for message");
-                let msg = if let Some(msg) = recv.recv().await {
-                    msg
-                } else {
-                    break
-                };
-
-                println!("got msg : {:?}", msg);
-
-                if let Err(err) = app.update(&model, msg).await {
-                    app.handle_error(err)
-                }
-            }
-        });
-
-        Self{sender, _rt : rt}
-    }
-
-    fn send(&self, msg : A::Msg) {
-        println!("sending msg : {:?}", msg);
-        self.sender
-            .blocking_send(msg)
-            .unwrap();
-    }
-}
