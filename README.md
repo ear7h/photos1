@@ -13,11 +13,11 @@ A photo editing application.
 	* [x] temperature
 	* [ ] tint
 	* [x] toggle original
+	* [ ] handle arbitrary shaders from config file
 * ui
-	* [ ] zoom and pan image
+	* [x] zoom and pan image
 	* [ ] crop, small rotations, and 90 degree rotations (passed through to the file)
-	* [ ] handle more image formats (needs to get pixel buf from other library)
+	* [x] handle more image formats (needs to get pixel buf from other library)
 	* [ ] folder viewer
 	* [ ] saving edits
 	* [ ] exporting edits (needs offscreen rendering pipeline)
-
